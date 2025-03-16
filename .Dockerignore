@@ -1,0 +1,12 @@
+# Security and credentials
+orcha-calendar-key.json
+*.pem
+*.key
+*.p12
+creds/
+.env
+
+__pycache__/
+venv/
+.DS_Store
+*.log
