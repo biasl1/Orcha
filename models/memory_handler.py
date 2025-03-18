@@ -2,6 +2,7 @@ import chromadb
 import os
 import json
 import time
+from datetime import datetime
 from sentence_transformers import SentenceTransformer
 import threading
 
@@ -35,7 +36,9 @@ class BotMemory:
     
     def add_interaction(self, user_id, message, response, priority=False):
         """Add a user interaction to memory (queues for background processing)"""
-        timestamp = time.time()
+        # Use precise ISO timestamp
+        timestamp = datetime.now().isoformat()
+        
         interaction = {
             "user_id": user_id,
             "message": message,
@@ -59,19 +62,24 @@ class BotMemory:
             
             if interaction:
                 try:
-                    # Create combined text for embedding
-                    text = f"User: {interaction['message']}\nBot: {interaction['response']}"
+                    # Format timestamp for human readability
+                    dt = datetime.fromisoformat(interaction['timestamp'])
+                    formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Create combined text for embedding with timestamp
+                    text = f"[{formatted_time}] User: {interaction['message']}\nBot: {interaction['response']}"
                     
                     # Generate embedding
                     embedding = self.model.encode(text).tolist()
                     
-                    # Add to collection
+                    # Add to collection with timestamp in metadata
                     self.collection.add(
                         embeddings=[embedding],
                         documents=[text],
                         metadatas=[{
                             "user_id": interaction["user_id"],
-                            "timestamp": interaction["timestamp"]
+                            "timestamp": interaction["timestamp"],
+                            "date": dt.date().isoformat()
                         }],
                         ids=[f"{interaction['user_id']}_{interaction['timestamp']}"]
                     )
@@ -83,8 +91,10 @@ class BotMemory:
             time.sleep(0.1)
     
     def get_relevant_context(self, user_id, current_query, max_results=5):
-        """Retrieve relevant past interactions based on semantic similarity"""
+        """Retrieve relevant past interactions based on semantic similarity with time awareness"""
         try:
+            current_time = datetime.now()
+            
             # Encode the query
             query_embedding = self.model.encode(current_query).tolist()
             
@@ -95,12 +105,40 @@ class BotMemory:
                 where={"user_id": user_id} if user_id else {}  # Filter by user if specified
             )
             
-            # Format results into a context string
+            # Format results into a context string with time information
             if results and results.get("documents"):
-                context = "\n---\n".join(results["documents"][0])
-                return f"Previous relevant interactions:\n{context}\n\nCurrent query: {current_query}"
+                contexts = []
+                
+                for i, document in enumerate(results["documents"][0]):
+                    # Extract metadata for time-based relevance
+                    metadata = results["metadatas"][0][i]
+                    timestamp = metadata.get("timestamp", "")
+                    
+                    if timestamp:
+                        # Calculate time delta
+                        past_time = datetime.fromisoformat(timestamp)
+                        time_delta = current_time - past_time
+                        days = time_delta.days
+                        hours = time_delta.seconds // 3600
+                        minutes = (time_delta.seconds % 3600) // 60
+                        
+                        # Format time delta for context
+                        if days > 0:
+                            time_context = f"{days} days ago"
+                        elif hours > 0:
+                            time_context = f"{hours} hours ago"
+                        else:
+                            time_context = f"{minutes} minutes ago"
+                        
+                        # Add document with time context
+                        contexts.append(f"{document} (from {time_context})")
+                    else:
+                        contexts.append(document)
+                
+                return f"Previous relevant interactions:\n" + "\n---\n".join(contexts) + f"\n\nCurrent time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\nCurrent query: {current_query}"
             
-            return current_query
+            # If no results, still include current time
+            return f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n{current_query}"
         except Exception as e:
             print(f"Error retrieving context: {str(e)}")
             return current_query

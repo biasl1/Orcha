@@ -7,21 +7,24 @@ import uuid
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from models.memory_handler import get_memory
+from datetime import datetime, timedelta
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 # System prompt template to guide behavior
-SYSTEM_PROMPT = """You are Lenny Bot, a professional AI assistant specialized in Bread. Your responses should be:
-- Helpful, accurate, and concise
-- Professional (even insistent if it needs to) in tone unless the user requests otherwise
-- Structured clearly with appropriate formatting (no emojis, slang, or overly casual language)
-- Based on the provided context and conversation history
-- Honest about limitations (say when you don't know) -> Ask for clarification if needed
-- Respectful and mindful of user privacy
+SYSTEM_PROMPT = """You are LennyBot, a professional AI assistant with time awareness. Your responses should:
 
-Remember to tailor responses to the specific user based on their interaction history.
+1. Be helpful, accurate, and professional
+2. Acknowledge time context - note how recently or long ago previous interactions occurred
+3. Consider the current time of day and date in your responses
+4. Reference specific dates and times when discussing schedules or deadlines
+5. Note significant gaps between conversations (e.g., "It's been a week since we last talked")
+6. Maintain professionalism while being mindful of time-appropriate greetings (morning/evening)
+7. Avoid Emoji and informal language unless contextually appropriate
+The current date and time is provided with each query. Use this information to make your responses temporally relevant.
 """
+
 
 class LLMException(Exception):
     """Custom exception for LLM-related errors"""
@@ -41,7 +44,7 @@ class ResponseValidator:
     def clean(response: str) -> str:
         """Clean up response text"""
         # Remove redundant prefixes often added by LLMs
-        prefixes = ["Assistant:", "Orcha:", "AI:"]
+        prefixes = ["Assistant:", "Bot:", "AI:"]
         for prefix in prefixes:
             if response.startswith(prefix):
                 response = response[len(prefix):].strip()
@@ -49,7 +52,7 @@ class ResponseValidator:
         return response
 
 class ConversationManager:
-    """Manages conversation context and history"""
+    """Manages conversation context and history with time awareness"""
     
     def __init__(self, max_conversation_turns: int = 5):
         self.conversations: Dict[str, List[Dict[str, Any]]] = {}
@@ -57,19 +60,38 @@ class ConversationManager:
     
     def add_exchange(self, user_id: str, query: str, response: str) -> None:
         """Add a query-response exchange to user's conversation history"""
+        now = datetime.now()
+        
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         
+        # Calculate time since last message if available
+        time_context = ""
+        if self.conversations[user_id]:
+            last_msg_time = datetime.fromisoformat(self.conversations[user_id][-1]["timestamp"])
+            delta = now - last_msg_time
+            
+            if delta.days > 0:
+                time_context = f" (after {delta.days} days)"
+            elif delta.seconds > 3600:
+                time_context = f" (after {delta.seconds // 3600} hours)"
+            elif delta.seconds > 60:
+                time_context = f" (after {delta.seconds // 60} minutes)"
+        
+        # Add user message with timestamp
         self.conversations[user_id].append({
             "role": "user",
             "content": query,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now.isoformat(),
+            "time_context": time_context
         })
         
+        # Add assistant response with timestamp
         self.conversations[user_id].append({
             "role": "assistant",
             "content": response,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": now.isoformat(),
+            "time_context": ""  # No delay for assistant response
         })
         
         # Keep only recent turns
@@ -77,15 +99,25 @@ class ConversationManager:
             self.conversations[user_id] = self.conversations[user_id][-self.max_turns * 2:]
     
     def get_recent_conversation(self, user_id: str) -> List[Dict[str, str]]:
-        """Get recent conversation history for a user"""
+        """Get recent conversation history for a user with time information"""
         if user_id not in self.conversations:
             return []
         
-        # Convert to the format expected by LLM
-        return [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in self.conversations[user_id]
-        ]
+        # Convert to the format expected by LLM, including time context
+        formatted_messages = []
+        
+        for msg in self.conversations[user_id]:
+            # Format message with time context if available
+            content = msg["content"]
+            if msg.get("time_context"):
+                content = f"{content} {msg['time_context']}"
+                
+            formatted_messages.append({
+                "role": msg["role"],
+                "content": content
+            })
+        
+        return formatted_messages
 
 # Initialize conversation manager
 conversation_manager = ConversationManager()
@@ -202,15 +234,18 @@ def check_docker_ollama() -> bool:
 
 def process_query(query: str, user_id: Optional[str] = None) -> str:
     """Process a user query with context and return a response"""
-    request_id = str(uuid.uuid4())[:8]  # Generate short request ID for tracking
-    logger.info(f"[{request_id}] Processing query for user {user_id}: {query[:50]}...")
+    request_id = str(uuid.uuid4())[:8]
+    current_time = datetime.now()
+    logger.info(f"[{request_id}] Processing query for user {user_id} at {current_time.isoformat()}: {query[:50]}...")
     
     try:
         # Prepare messages
         messages = []
         
         # Add system prompt
-        messages.append({"role": "system", "content": SYSTEM_PROMPT})
+        current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        system_prompt = f"{SYSTEM_PROMPT}\n\nCurrent date and time: {current_time_str}"
+        messages.append({"role": "system", "content": system_prompt})
         
         # Add conversation context if user_id available
         if user_id:
@@ -233,9 +268,10 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
             except Exception as e:
                 logger.warning(f"[{request_id}] Error retrieving memory context: {str(e)}")
         
+        query_with_time = f"{query}\n\nCurrent time: {current_time_str}"
         # Add current query if not already in conversation
         if not messages or messages[-1]["role"] != "user" or messages[-1]["content"] != query:
-            messages.append({"role": "user", "content": query})
+            messages.append({"role": "user", "content": query_with_time})
         
         # Check LLM availability
         if not llm_client.check_availability():
