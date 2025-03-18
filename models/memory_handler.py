@@ -106,32 +106,39 @@ class BotMemory:
             )
             
             # Format results into a context string with time information
-            if results and results.get("documents"):
+            if results and results.get("documents") and results["documents"][0]:
                 contexts = []
                 
                 for i, document in enumerate(results["documents"][0]):
                     # Extract metadata for time-based relevance
-                    metadata = results["metadatas"][0][i]
-                    timestamp = metadata.get("timestamp", "")
-                    
-                    if timestamp:
-                        # Calculate time delta
-                        past_time = datetime.fromisoformat(timestamp)
-                        time_delta = current_time - past_time
-                        days = time_delta.days
-                        hours = time_delta.seconds // 3600
-                        minutes = (time_delta.seconds % 3600) // 60
+                    if i < len(results["metadatas"][0]):
+                        metadata = results["metadatas"][0][i]
+                        timestamp = metadata.get("timestamp", "")
                         
-                        # Format time delta for context
-                        if days > 0:
-                            time_context = f"{days} days ago"
-                        elif hours > 0:
-                            time_context = f"{hours} hours ago"
+                        if timestamp and isinstance(timestamp, str):
+                            try:
+                                # Calculate time delta
+                                past_time = datetime.fromisoformat(timestamp)
+                                time_delta = current_time - past_time
+                                days = time_delta.days
+                                hours = time_delta.seconds // 3600
+                                minutes = (time_delta.seconds % 3600) // 60
+                                
+                                # Format time delta for context
+                                if days > 0:
+                                    time_context = f"{days} days ago"
+                                elif hours > 0:
+                                    time_context = f"{hours} hours ago"
+                                else:
+                                    time_context = f"{minutes} minutes ago"
+                                
+                                # Add document with time context
+                                contexts.append(f"{document} (from {time_context})")
+                            except ValueError:
+                                # Handle invalid timestamp format
+                                contexts.append(document)
                         else:
-                            time_context = f"{minutes} minutes ago"
-                        
-                        # Add document with time context
-                        contexts.append(f"{document} (from {time_context})")
+                            contexts.append(document)
                     else:
                         contexts.append(document)
                 
@@ -140,7 +147,7 @@ class BotMemory:
             # If no results, still include current time
             return f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n{current_query}"
         except Exception as e:
-            print(f"Error retrieving context: {str(e)}")
+            logger.error(f"Error retrieving context: {e}")
             return current_query
     
     def shutdown(self):

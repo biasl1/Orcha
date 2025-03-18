@@ -8,6 +8,9 @@ from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from models.memory_handler import get_memory
 from datetime import datetime, timedelta
+from utils.calendar import calendar_system
+from utils.processing import DateTimeExtractor
+
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -232,9 +235,44 @@ def check_docker_ollama() -> bool:
         logger.error(f"Error checking Docker: {e}")
         return False
 
+# Add this function to integrate calendar information
+def _get_calendar_context(user_id: str) -> str:
+    """Get upcoming calendar events as context for the LLM"""
+    try:
+        events = calendar_system.get_upcoming_events(user_id, days=1)  # Get today's events
+        if not events:
+            return ""
+        
+        event_texts = []
+        for event in events:
+            when = event['timestamp'].strftime("%I:%M %p")
+            event_texts.append(f"- {when}: {event['title']}")
+        
+        return f"\n\nUpcoming events today:\n" + "\n".join(event_texts)
+    except Exception as e:
+        logger.error(f"Error getting calendar context: {e}")
+        return ""
+
 def process_query(query: str, user_id: Optional[str] = None) -> str:
     """Process a user query with context and return a response"""
-    request_id = str(uuid.uuid4())[:8]
+    request_id = str(uuid.uuid4())[:8]  # Generate short request ID for tracking
+    logger.info(f"[{request_id}] Processing query for user {user_id}: {query[:50]}...")
+    
+    # Check for reminder intent
+    if _is_reminder_request(query):
+        result = _handle_reminder(query, user_id)
+        
+        # Store the reminder interaction in memory and conversation
+        if user_id:
+            conversation_manager.add_exchange(user_id, query, result)
+            memory = get_memory()
+            try:
+                memory.add_interaction(user_id, query, result, priority=True)
+            except Exception as e:
+                logger.warning(f"Error storing reminder in memory: {str(e)}")
+        
+        return result
+    
     current_time = datetime.now()
     logger.info(f"[{request_id}] Processing query for user {user_id} at {current_time.isoformat()}: {query[:50]}...")
     
@@ -245,6 +283,13 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
         # Add system prompt
         current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
         system_prompt = f"{SYSTEM_PROMPT}\n\nCurrent date and time: {current_time_str}"
+        
+        # Add calendar context if available
+        if user_id:
+            calendar_context = _get_calendar_context(user_id)
+            if calendar_context:
+                system_prompt += calendar_context
+        
         messages.append({"role": "system", "content": system_prompt})
         
         # Add conversation context if user_id available
@@ -306,6 +351,62 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
     except Exception as e:
         logger.error(f"[{request_id}] Unexpected error: {str(e)}", exc_info=True)
         return "I'm sorry, but something went wrong on my end. Please try again in a moment."
+
+def _is_reminder_request(query: str) -> bool:
+    """Check if query is a reminder request"""
+    reminder_keywords = [
+        "remind me", "set a reminder", "remember", "don't forget", 
+        "schedule", "calendar", "appointment"
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in reminder_keywords)
+
+def _handle_reminder(query: str, user_id: str) -> str:
+    """Extract reminder information and save to calendar"""
+    try:
+        # Extract date/time
+        reminder_time = DateTimeExtractor.extract_datetime(query)
+        
+        if not reminder_time:
+            return "I'd be happy to set a reminder, but I couldn't determine when. Please specify a date or time, like 'tomorrow at 3pm' or 'next Monday'."
+        
+        # Extract title - simple approach: use text before "remind me" or after "to"
+        title = ""
+        if "remind me to" in query.lower():
+            title = query.lower().split("remind me to", 1)[1].strip()
+        elif "reminder to" in query.lower():
+            title = query.lower().split("reminder to", 1)[1].strip()
+        elif "remember to" in query.lower():
+            title = query.lower().split("remember to", 1)[1].strip()
+        else:
+            # Fallback: use the whole query as title
+            title = query
+            
+        # Clean up title
+        time_markers = ["today", "tomorrow", "next week", "in", "at", "on"]
+        for marker in time_markers:
+            if f" {marker} " in title:
+                title = title.split(f" {marker} ")[0].strip()
+                
+        if not title:
+            title = "Reminder"
+        
+        # Add to calendar
+        event = calendar_system.add_event(
+            user_id=user_id,
+            title=title,
+            timestamp=reminder_time,
+            description="",
+            reminder=True
+        )
+        
+        # Format response
+        when = reminder_time.strftime("%A, %B %d at %I:%M %p")
+        return f"✅ I've set a reminder for you: \"{title}\" on {when}. I'll remind you when it's time!"
+        
+    except Exception as e:
+        logger.error(f"Error setting reminder: {e}")
+        return "I'm sorry, I couldn't set that reminder. Please try again with a clearer time specification."
 
 def get_metrics() -> Dict[str, Any]:
     """Return current performance metrics"""
