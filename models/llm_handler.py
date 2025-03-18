@@ -22,10 +22,13 @@ SYSTEM_PROMPT = """You are LennyBot, a professional AI assistant with time aware
 2. Acknowledge time context - note how recently or long ago previous interactions occurred
 3. Consider the current time of day and date in your responses
 4. Reference specific dates and times when discussing schedules or deadlines
-5. Note significant gaps between conversations (e.g., "It's been a week since we last talked")
+5. Note significant gaps between conversations (e.g., "It's been -- since we last talked")
 6. Maintain professionalism while being mindful of time-appropriate greetings (morning/evening)
-7. Avoid Emoji and informal language unless contextually appropriate
-The current date and time is provided with each query. Use this information to make your responses temporally relevant.
+7. Intelligently reason about calendar information when it's provided
+8. Offer relevant suggestions based on the user's schedule
+9. Identify potential schedule conflicts when they arise
+
+The current date and time is provided with each query. Calendar information is included when available. Use this information to make your responses temporally relevant and helpful for schedule management.
 """
 
 
@@ -235,60 +238,131 @@ def check_docker_ollama() -> bool:
         logger.error(f"Error checking Docker: {e}")
         return False
 
-# Add this function to integrate calendar information
+# Replace _get_calendar_context with this enhanced version
 def _get_calendar_context(user_id: str) -> str:
-    """Get upcoming calendar events as context for the LLM"""
+    """Get comprehensive calendar context for the LLM"""
     try:
-        events = calendar_system.get_upcoming_events(user_id, days=1)  # Get today's events
-        if not events:
-            return ""
-        
-        event_texts = []
-        for event in events:
-            when = event['timestamp'].strftime("%I:%M %p")
-            event_texts.append(f"- {when}: {event['title']}")
-        
-        return f"\n\nUpcoming events today:\n" + "\n".join(event_texts)
+        # Get rich calendar context using the new method
+        context = calendar_system.get_calendar_context(user_id)
+        if context:
+            return f"\n\n---\nCALENDAR INFORMATION:\n{context}\n---\n"
+        return ""
     except Exception as e:
-        logger.error(f"Error getting calendar context: {e}")
+        logger.error(f"Error getting calendar context: {str(e)}")
         return ""
 
+# Add this helper function for natural language calendar operations
+def _detect_calendar_intent(query: str) -> tuple:
+    """Detect various calendar-related intents in user query"""
+    query_lower = query.lower()
+    
+    # Common calendar operations
+    if any(x in query_lower for x in ["schedule", "add event", "create event", "new appointment"]):
+        return "create", query
+        
+    if any(x in query_lower for x in ["what's on my calendar", "my schedule", "what do i have", "appointments", "upcoming events"]):
+        return "view", query
+        
+    if any(x in query_lower for x in ["cancel", "delete event", "remove appointment"]):
+        return "delete", query
+        
+    if "remind" in query_lower or "reminder" in query_lower:
+        return "remind", query
+        
+    if any(x in query_lower for x in ["free time", "available", "when am i free", "find time"]):
+        return "find_time", query
+        
+    # No calendar intent detected
+    return None, query
+
+# Update the process_query function to handle calendar requests
 def process_query(query: str, user_id: Optional[str] = None) -> str:
     """Process a user query with context and return a response"""
-    request_id = str(uuid.uuid4())[:8]  # Generate short request ID for tracking
-    logger.info(f"[{request_id}] Processing query for user {user_id}: {query[:50]}...")
-    
-    # Check for reminder intent
-    if _is_reminder_request(query):
-        result = _handle_reminder(query, user_id)
-        
-        # Store the reminder interaction in memory and conversation
-        if user_id:
-            conversation_manager.add_exchange(user_id, query, result)
-            memory = get_memory()
-            try:
-                memory.add_interaction(user_id, query, result, priority=True)
-            except Exception as e:
-                logger.warning(f"Error storing reminder in memory: {str(e)}")
-        
-        return result
-    
+    request_id = str(uuid.uuid4())[:8]
     current_time = datetime.now()
     logger.info(f"[{request_id}] Processing query for user {user_id} at {current_time.isoformat()}: {query[:50]}...")
-    
+
+    # Initialize is_calendar_query to False by default
+    is_calendar_query = False
+
     try:
+        # Detect calendar-related intents
+        calendar_intent, _ = _detect_calendar_intent(query)
+        
+        # Handle calendar-specific intents
+        if calendar_intent == "remind":
+            result = _handle_reminder(query, user_id)
+            # Store in memory and conversation
+            if user_id:
+                conversation_manager.add_exchange(user_id, query, result)
+                try:
+                    memory = get_memory()
+                    memory.add_interaction(user_id, query, result, priority=True)
+                except Exception as e:
+                    logger.warning(f"Error storing in memory: {str(e)}")
+            return result
+        elif calendar_intent == "create":
+            result = _handle_calendar_creation(query, user_id)
+            if user_id:
+                conversation_manager.add_exchange(user_id, query, result)
+                try:
+                    memory = get_memory()
+                    memory.add_interaction(user_id, query, result, priority=True)
+                except Exception as e:
+                    logger.warning(f"Error storing in memory: {str(e)}")
+            return result
+        elif calendar_intent == "view":
+            # For viewing calendar, we'll use the calendar context in the LLM response
+            is_calendar_query = True
+        elif calendar_intent == "find_time":
+            # For find_time, add available slots to the context
+            today = datetime.now().date()
+            tomorrow = today + timedelta(days=1)
+            slots_today = calendar_system.suggest_times(user_id, preferred_date=today)
+            slots_tomorrow = calendar_system.suggest_times(user_id, preferred_date=tomorrow)
+            
+            available_text = "Available times:\n\nToday:\n"
+            for start, end in slots_today:
+                available_text += f"- {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
+            
+            available_text += "\nTomorrow:\n"
+            for start, end in slots_tomorrow:
+                available_text += f"- {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
+            
+            # Add this to the system prompt
+            system_prompt += f"\n\n{available_text}"
+            is_calendar_query = True
+
         # Prepare messages
         messages = []
         
-        # Add system prompt
+        # Add system prompt with current time
         current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
         system_prompt = f"{SYSTEM_PROMPT}\n\nCurrent date and time: {current_time_str}"
         
-        # Add calendar context if available
-        if user_id:
+        # Always include calendar context for calendar-related queries
+        if user_id and is_calendar_query:
             calendar_context = _get_calendar_context(user_id)
-            if calendar_context:
+            if (calendar_context):
                 system_prompt += calendar_context
+                
+                # For calendar-specific operations, add special instructions
+                if calendar_intent == "create":
+                    system_prompt += "\nThe user wants to create a calendar event. Help extract the event title, date, time, and any other details."
+                elif calendar_intent == "view":
+                    system_prompt += "\nThe user wants to view their calendar. Summarize their schedule in a helpful way."
+                elif calendar_intent == "delete":
+                    system_prompt += "\nThe user wants to cancel or delete an event. Help identify which event they're referring to."
+                elif calendar_intent == "find_time":
+                    system_prompt += "\nThe user wants to find available time. Analyze their schedule and suggest some free slots."
+        
+        # Regular (non-calendar) queries can still benefit from calendar context sometimes
+        elif user_id:
+            events_today = calendar_system.get_upcoming_events(user_id, days=1)
+            if events_today:
+                # Only add brief calendar context for regular queries
+                calendar_brief = f"You have {len(events_today)} event(s) scheduled today."
+                system_prompt += f"\n\n{calendar_brief}"
         
         messages.append({"role": "system", "content": system_prompt})
         
