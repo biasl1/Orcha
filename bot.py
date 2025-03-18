@@ -4,7 +4,10 @@ import os
 import logging
 import datetime
 from dotenv import load_dotenv
-from models.llm_handler import process_query, schedule_random_surreal_message
+from models.llm_handler import process_query, get_metrics
+from models.memory_handler import get_memory
+import atexit
+import json
 
 # Set up logging
 logging.basicConfig(
@@ -27,33 +30,40 @@ def start(update: Update, context: CallbackContext) -> None:
     # Log the start command
     user = update.effective_user
     user_logger.info(f"User {user.id} ({user.username}) started the bot")
-    update.message.reply_text("Hello! I'm Orcha, your personal secretary. What can I do for you?")
+    update.message.reply_text("Hello! I'm Orcha, your professional AI assistant. How can I help you today?")
 
-def send_telegram_message(chat_id, text):
-    """Send a message to a specific Telegram chat"""
-    # We'll use the global updater object to send messages
-    updater.bot.send_message(chat_id=chat_id, text=text)
+def stats_command(update: Update, context: CallbackContext) -> None:
+    """Handler for /stats command - shows bot statistics"""
+    # Only allow specific users to access stats
+    authorized_users = [1720592375, 1473396937]  # Replace with your actual admin user IDs
+    
+    if update.effective_user.id not in authorized_users:
+        update.message.reply_text("Sorry, you're not authorized to view stats.")
+        return
+    
+    metrics = get_metrics()
+    formatted_stats = json.dumps(metrics, indent=2)
+    update.message.reply_text(f"Current statistics:\n```\n{formatted_stats}\n```", parse_mode="Markdown")
 
 def handle_message(update: Update, context: CallbackContext) -> None:
     """Process user messages and respond using the LLM."""
     user_message = update.message.text
     chat_id = update.effective_chat.id
     user = update.effective_user
+    user_id = str(user.id)  # Convert to string for consistency
     
     # Log the user's message
-    user_logger.info(f"User {user.id} ({user.username}): {user_message}")
+    user_logger.info(f"User {user_id} ({user.username}): {user_message}")
     
-    # Schedule a random surreal message for this user
-    schedule_random_surreal_message(str(chat_id), send_telegram_message)
+    # Set typing indicator
+    context.bot.send_chat_action(chat_id=chat_id, action='typing')
     
-    # No "Processing..." message - like a human!
-    
-    # Get response from LLM
-    response = process_query(user_message)
+    # Get response from LLM with user context
+    response = process_query(user_message, user_id)
     update.message.reply_text(response)
     
     # Log the bot's response
-    user_logger.info(f"Bot to {user.id}: {response[:100]}...")
+    user_logger.info(f"Bot to {user_id}: {response[:100]}...")
 
 def main():
     # Get token from environment variable
@@ -62,12 +72,16 @@ def main():
         print("Error: TELEGRAM_BOT_TOKEN environment variable not set!")
         return
     
+    memory = get_memory()
+    atexit.register(memory.shutdown)
+    
     global updater
     updater = Updater(token)
     dp = updater.dispatcher
 
     # Add handlers
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stats", stats_command))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
     updater.start_polling()

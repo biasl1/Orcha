@@ -5,3 +5,6 @@ orcha-calendar-key.json
 *.p12
 creds/
 .env
+orcha_venv/
+vector_db
+.DS_Store

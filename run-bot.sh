@@ -2,7 +2,7 @@
 
 # Create logs directory if it doesn't exist
 echo "Creating logs directory..."
-mkdir -p "$(pwd)/logs"
+mkdir -p "$(pwd)/logs" "$(pwd)/vector_db"
 
 # Check if Ollama is running
 echo "Checking if Ollama is running..."
@@ -17,17 +17,18 @@ echo "Cleaning up previous containers..."
 docker stop orcha-telegram-bot 2>/dev/null || true
 docker rm orcha-telegram-bot 2>/dev/null || true
 
-# Build the Docker image from scratch (no cache)
+# Build the Docker image (WITH cache to save time)
 echo "Building Docker image..."
-docker build --no-cache -t orcha-bot . || { echo "Build failed!"; exit 1; }
+docker build -t orcha-bot . || { echo "Build failed!"; exit 1; }
 
-# Run the container with environment variables
+# Run the container with environment variables and network host mode
 echo "Starting bot container..."
 docker run -d \
   --name orcha-telegram-bot \
   --env-file .env \
-  --link ollama \
+  --network=host \
   --mount type=bind,source="$(pwd)/logs",target=/app/logs \
+  --mount type=bind,source="$(pwd)/vector_db",target=/app/vector_db \
   orcha-bot
 
 # Show logs
