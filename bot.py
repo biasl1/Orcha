@@ -241,6 +241,31 @@ def confirm_reset_command(update: Update, context: CallbackContext) -> None:
         
     except Exception as e:
         update.message.reply_text(f"Error resetting your data: {str(e)}")
+def test_reminder_command(update: Update, context: CallbackContext) -> None:
+    """Test the LLM-powered reminder system with a fake event"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    # Create a test event
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    event = {
+        "id": "test_reminder",
+        "title": "Test Reminder",
+        "description": "This is a test of the LLM reminder system",
+        "timestamp": now + timedelta(minutes=5),
+        "created_at": now,
+        "reminder": True
+    }
+    
+    # Generate the reminder
+    from utils.llm_reminder_generator import LLMReminderGenerator
+    generator = LLMReminderGenerator()
+    message = generator.generate_reminder(user_id, event)
+    
+    # Send the test reminder
+    update.message.reply_text(f"Test reminder generated:\n\n{message}", parse_mode="Markdown")
+    user_logger.info(f"Test reminder sent to user {user_id}")
 
 def main():
     # Get token from environment variable
@@ -264,16 +289,12 @@ def main():
     dp.add_handler(CommandHandler("reset", reset_user_command))
     dp.add_handler(CommandHandler("resetme", reset_my_data_command))
     dp.add_handler(CommandHandler("confirmreset", confirm_reset_command))
+    dp.add_handler(CommandHandler("testreminder", test_reminder_command))
+    
     # Start the reminder scheduler
     reminder_scheduler.start(updater.bot)
-    
-    from apscheduler.schedulers.background import BackgroundScheduler
-    scheduler = BackgroundScheduler(timezone=pytz.UTC)
-    scheduler.add_job(check_reminders, 'interval', seconds=30)
-    scheduler.start()
+    atexit.register(reminder_scheduler.stop)
 
-    # Make sure to register a clean shutdown
-    atexit.register(lambda: scheduler.shutdown())
 
     updater.start_polling()
     print("Bot is running!")

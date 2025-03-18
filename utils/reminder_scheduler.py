@@ -3,6 +3,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from utils.calendar import calendar_system
+from utils.llm_reminder_generator import LLMReminderGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,7 @@ class ReminderScheduler:
         self.should_run = False
         self.scheduler_thread = None
         self.check_interval = 60  # Check every 60 seconds by default
+        self.reminder_generator = LLMReminderGenerator()
     
     def start(self, bot=None):
         """Start the reminder scheduler"""
@@ -46,46 +48,56 @@ class ReminderScheduler:
             self.scheduler_thread.join(timeout=5)
         logger.info("Reminder scheduler stopped")
     
-    def _scheduler_loop(self):
-        """Main scheduler loop that checks for due reminders"""
-        while self.should_run:
-            try:
-                self._check_reminders()
-            except Exception as e:
-                logger.error(f"Error in reminder scheduler: {e}")
-                
-            # Sleep until next check
-            time.sleep(self.check_interval)
-    
     def _check_reminders(self):
         """Check for due reminders and send notifications"""
         if not self.bot:
             return
             
-        due_reminders = calendar_system.get_due_reminders()
-        for reminder in due_reminders:
-            try:
-                user_id = reminder['user_id']
-                event = reminder['event']
+        try:
+            due_reminders = calendar_system.get_due_reminders()
+            if due_reminders:
+                logger.info(f"Found {len(due_reminders)} due reminders")
                 
-                # Format message
-                message = f"🔔 *Reminder*: {event['title']}"
-                if event.get('description'):
-                    message += f"\n\n{event['description']}"
-                    
-                # Send notification - ensure user_id is numeric
+            for reminder in due_reminders:
                 try:
-                    chat_id = int(user_id)
-                    self.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Sent reminder to user {user_id} for event '{event['title']}'")
-                except ValueError:
-                    logger.error(f"Invalid user_id format: {user_id}")
-            except Exception as e:
-                logger.error(f"Error sending reminder: {e}", exc_info=True)
+                    user_id = reminder['user_id']
+                    event = reminder['event']
+                    
+                    logger.info(f"Processing reminder for user {user_id}: {event['title']}")
+                    
+                    # Generate personalized reminder using LLM
+                    message = self.reminder_generator.generate_reminder(user_id, event)
+                        
+                    # Send notification
+                    try:
+                        chat_id = int(user_id)
+                        self.bot.send_message(
+                            chat_id=chat_id,
+                            text=message,
+                            parse_mode="Markdown"
+                        )
+                        logger.info(f"Sent LLM-generated reminder to user {user_id} for event '{event['title']}'")
+                    except ValueError:
+                        logger.error(f"Invalid user_id format: {user_id}")
+                except Exception as e:
+                    logger.error(f"Error processing reminder: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error in reminder scheduler: {e}", exc_info=True)
+    
 
+    def _scheduler_loop(self):
+        """Main scheduler loop that periodically checks for reminders"""
+        logger.info("Reminder scheduler loop started")
+        
+        while self.should_run:
+            try:
+                self._check_reminders()
+            except Exception as e:
+                logger.error(f"Error in scheduler loop: {e}")
+                
+            # Sleep until next check
+            time.sleep(self.check_interval)
+        
+        logger.info("Reminder scheduler loop stopped")
 # Global scheduler instance
 reminder_scheduler = ReminderScheduler()

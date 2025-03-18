@@ -15,22 +15,14 @@ from utils.processing import DateTimeExtractor
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# System prompt template to guide behavior
-SYSTEM_PROMPT = """You are Orcha, a professional AI assistant.
+SYSTEM_PROMPT = """You are Lenny, a professional AI assistant.
 
-Basic time information is provided with each conversation:
-- FIRST_CONVERSATION means this is your first time talking to this user
-- SAME_CONVERSATION means you are in an ongoing conversation
-- SAME_DAY means you talked earlier today with this user
-- NEW_CONVERSATION means you talked on a different day
+Time information provided with each query:
+- FIRST_CONVERSATION: Welcome the user
+- SAME_DAY: Be conversational but acknowledge you've spoken earlier today
+- RETURNING_USER: Greet user as returning
 
-Use appropriate greetings based on this information:
-- For FIRST_CONVERSATION: Welcome the user
-- For SAME_CONVERSATION: Continue naturally
-- For SAME_DAY: Acknowledge resuming the conversation
-- For NEW_CONVERSATION: Greet as returning after some time
-
-Always be professional, helpful, and to the point in your responses.
+Be professional, helpful, and focused in your responses.
 """
 
 class LLMException(Exception):
@@ -89,27 +81,6 @@ class ConversationManager:
         if len(self.conversations[user_id]) > self.max_turns * 2:
             self.conversations[user_id] = self.conversations[user_id][-self.max_turns * 2:]
     
-    def get_recent_conversation(self, user_id: str) -> List[Dict[str, str]]:
-        """Get recent conversation history for a user with time information"""
-        if user_id not in self.conversations:
-            return []
-        
-        # Convert to the format expected by LLM, including time context
-        formatted_messages = []
-        
-        for msg in self.conversations[user_id]:
-            # Format message with time context if available
-            content = msg["content"]
-            if msg.get("time_context"):
-                content = f"{content} {msg['time_context']}"
-                
-            formatted_messages.append({
-                "role": msg["role"],
-                "content": content
-            })
-    
-        return formatted_messages
-    
     def reset_user_data(self, user_id: str) -> bool:
         """Reset conversation history for a specific user"""
         user_id = str(user_id)
@@ -143,7 +114,7 @@ conversation_manager = ConversationManager()
 class LLMClient:
     """Client for interacting with LLM services"""
     
-    def __init__(self, host: str = "localhost", timeout: int = 300):
+    def __init__(self, host: str = "localhost", timeout: int = 3000):
         self.host = host
         self.timeout = timeout
         self.metrics = {
@@ -223,33 +194,6 @@ class LLMClient:
 # Initialize LLM client
 llm_client = LLMClient()
 
-def check_docker_ollama() -> bool:
-    """Check if Ollama container is running, start if needed."""
-    try:
-        # Check if container exists and is running
-        result = subprocess.run(
-            ["docker", "inspect", "ollama"], 
-            capture_output=True, 
-            text=True
-        )
-        
-        if result.returncode != 0:
-            logger.warning("Ollama container not found")
-            return False
-            
-        container_info = json.loads(result.stdout)[0]
-        is_running = container_info.get("State", {}).get("Running", False)
-        
-        if not is_running:
-            logger.info("Starting Ollama container...")
-            subprocess.run(["docker", "start", "ollama"], check=True)
-            time.sleep(3)
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error checking Docker: {e}")
-        return False
-
 # Replace _get_calendar_context with this enhanced version
 def _get_calendar_context(user_id: str) -> str:
     """Get comprehensive calendar context for the LLM"""
@@ -265,64 +209,54 @@ def _get_calendar_context(user_id: str) -> str:
 
 # Add this helper function for natural language calendar operations
 def _detect_calendar_intent(query: str) -> tuple:
-    """Detect various calendar-related intents in user query"""
+    """Detect basic calendar intents in user query"""
     query_lower = query.lower()
     
-    # Common calendar operations
-    if any(x in query_lower for x in ["schedule", "add event", "create event", "new appointment"]):
-        return "create", query
-        
-    if any(x in query_lower for x in ["what's on my calendar", "my schedule", "what do i have", "appointments", "upcoming events"]):
-        return "view", query
-        
-    if any(x in query_lower for x in ["cancel", "delete event", "remove appointment"]):
-        return "delete", query
-        
-    if "remind" in query_lower or "reminder" in query_lower:
-        return "remind", query
-        
-    if any(x in query_lower for x in ["free time", "available", "when am i free", "find time"]):
-        return "find_time", query
-        
-    # No calendar intent detected
+    # Map keywords to intents
+    intent_patterns = {
+        "create": ["schedule", "add event", "create event", "new appointment"],
+        "view": ["what's on my calendar", "my schedule", "what do i have", "appointments"],
+        "delete": ["cancel", "delete event", "remove appointment"],
+        "remind": ["remind me", "reminder", "remember to"],
+        "find_time": ["free time", "available", "when am i free"]
+    }
+    
+    # Check for intent matches
+    for intent, patterns in intent_patterns.items():
+        if any(pattern in query_lower for pattern in patterns):
+            return intent, query
+    
     return None, query
 
 def get_simple_time_context(user_id):
     """Generate simple time context that's hard to misinterpret"""
     now = datetime.now()
-    
-    # Format current time in a clear way
-    current_time = now.strftime("%I:%M %p")
     today = now.strftime("%A, %B %d, %Y")
     
-    # Get last interaction time if available
+    # No previous conversation case
+    if user_id not in conversation_manager.conversations or not conversation_manager.conversations[user_id]:
+        return f"FIRST_CONVERSATION | TODAY: {today}"
+    
+    # Find last user timestamp
     last_time = None
-    if user_id in conversation_manager.conversations and conversation_manager.conversations[user_id]:
-        for msg in reversed(conversation_manager.conversations[user_id]):
-            if msg["role"] == "user" and "timestamp" in msg:
-                try:
-                    last_time = datetime.fromisoformat(msg["timestamp"])
-                    break
-                except:
-                    pass
+    for msg in reversed(conversation_manager.conversations[user_id]):
+        if msg["role"] == "user" and "timestamp" in msg:
+            try:
+                last_time = datetime.fromisoformat(msg["timestamp"])
+                break
+            except:
+                pass
     
-    # Build simple context statement
     if not last_time:
-        return f"FIRST_CONVERSATION | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
+        return f"FIRST_CONVERSATION | TODAY: {today}"
     
-    # Determine if this is the same day
+    # Simple binary context
     if last_time.date() == now.date():
-        if (now - last_time).seconds < 3600:  # Less than an hour
-            return f"SAME_CONVERSATION | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
-        else:
-            last_time_str = last_time.strftime("%I:%M %p")
-            return f"SAME_DAY | LAST_MESSAGE_AT: {last_time_str} | CURRENT_TIME: {current_time}"
+        return f"SAME_DAY | TODAY: {today}"
     else:
-        # Different day - don't try to calculate days difference, just state the facts
-        last_date = last_time.strftime("%A, %B %d")
-        return f"NEW_CONVERSATION | LAST_CONVERSATION_ON: {last_date} | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
+        last_date = last_time.strftime("%A, %B %d, %Y")
+        return f"RETURNING_USER | LAST_TALKED: {last_date} | TODAY: {today}"
 
-# Also, move _handle_calendar_creation function here from calendar.py
 def _handle_calendar_creation(query: str, user_id: str) -> str:
     """Extract event details from natural language and create calendar event"""
     try:
@@ -424,126 +358,77 @@ Format your response as JSON:
     
 
 def process_query(query: str, user_id: Optional[str] = None) -> str:
-    """Process a user query with simple time context"""
+    """Process a user query with context and return a response"""
     request_id = str(uuid.uuid4())[:8]
     current_time = datetime.now()
-    logger.info(f"[{request_id}] Processing query for user {user_id} at {current_time.isoformat()}: {query[:50]}...")
-    
-    # Initialize is_calendar_query to False by default
-    is_calendar_query = False
+    logger.info(f"[{request_id}] Processing query: {query[:50]}...")
     
     try:
-        # Get simple time context
-        time_context = get_simple_time_context(user_id) if user_id else "FIRST_CONVERSATION"
-        
-        # Detect calendar-related intents
+        # Calendar intent detection
         calendar_intent, _ = _detect_calendar_intent(query)
         
-        # Handle calendar-specific intents directly
-        if calendar_intent == "remind":
-            result = _handle_reminder(query, user_id)
-            # Store in memory and conversation
+        # Special handlers for calendar operations
+        if calendar_intent in ["remind", "create"]:
+            handler = _handle_reminder if calendar_intent == "remind" else _handle_calendar_creation
+            result = handler(query, user_id)
+            
+            # Store in history/memory
             if user_id:
                 conversation_manager.add_exchange(user_id, query, result)
                 try:
                     memory = get_memory()
                     memory.add_interaction(user_id, query, result, priority=True)
                 except Exception as e:
-                    logger.warning(f"Error storing in memory: {str(e)}")
+                    logger.warning(f"Memory storage error: {str(e)}")
             return result
-        elif calendar_intent == "create":
-            result = _handle_calendar_creation(query, user_id)
-            if user_id:
-                conversation_manager.add_exchange(user_id, query, result)
-                try:
-                    memory = get_memory()
-                    memory.add_interaction(user_id, query, result, priority=True)
-                except Exception as e:
-                    logger.warning(f"Error storing in memory: {str(e)}")
-            return result
-        elif calendar_intent in ["view", "find_time", "delete"]:
-            is_calendar_query = True
+            
+        # Prepare context
+        time_context = get_simple_time_context(user_id) if user_id else "FIRST_CONVERSATION"
+        messages = [{"role": "system", "content": f"{time_context}\n\n{SYSTEM_PROMPT}"}]
         
-        # Prepare messages
-        messages = []
-        
-        # Create system prompt with time context
-        system_content = f"{SYSTEM_PROMPT}\n\nTIME_CONTEXT: {time_context}"
-        
-        # Add calendar context for calendar queries or if events today
-        if user_id and is_calendar_query:
-            calendar_context = _get_calendar_context(user_id)
-            if calendar_context:
-                system_content += calendar_context
-        elif user_id:
-            # For regular queries, check if there are events today
-            from utils.calendar import calendar_system
-            events_today = calendar_system.get_upcoming_events(user_id, days=1)
-            if events_today:
-                calendar_brief = f"You have {len(events_today)} event(s) scheduled today."
-                system_content += f"\n\n{calendar_brief}"
-        
-        # Add system message
-        messages.append({"role": "system", "content": system_content})
-        
-        # Add conversation history
+        # Add calendar context if appropriate
+        is_calendar_query = calendar_intent in ["view", "find_time", "delete"]
         if user_id:
-            history = conversation_manager.get_conversation(user_id)
-            messages.extend(history)
+            if is_calendar_query:
+                calendar_context = _get_calendar_context(user_id)
+                if calendar_context:
+                    messages[0]["content"] += calendar_context
+            else:
+                # Just add brief calendar info for non-calendar queries
+                events_today = calendar_system.get_upcoming_events(user_id, days=1)
+                if events_today:
+                    messages[0]["content"] += f"\n\nYou have {len(events_today)} event(s) today."
         
-        # Add memory context if available
+        # Add conversation history and memory
         if user_id:
+            messages.extend(conversation_manager.get_conversation(user_id))
             memory = get_memory()
-            context_query = memory.get_relevant_context(user_id, query)
-            if context_query != query:
-                query = context_query
+            query = memory.get_relevant_context(user_id, query)
+            
+        # Add current query
+        messages.append({"role": "user", "content": query})
         
-        # Add user query (with timestamp embedded directly)
-        time_stamp = current_time.strftime("%I:%M %p")
-        messages.append({"role": "user", "content": f"{query} [SENT_AT: {time_stamp}]"})
-        
-        # Check LLM availability
+        # Generate response
         if not llm_client.check_availability():
-            logger.error(f"[{request_id}] LLM service unavailable")
-            return "I'm sorry, but I'm currently unable to process your request due to a service issue. Please try again in a few moments."
-        
-        # Query LLM
+            return "Sorry, I'm temporarily unavailable. Please try again in a moment."
+            
         response_data = llm_client.query(messages)
+        response_text = ResponseValidator.clean(response_data["message"]["content"])
         
-        # Extract and clean response
-        response_text = response_data["message"]["content"]
-        response_text = ResponseValidator.clean(response_text)
-        
-        # Add to conversation history
+        # Save to history/memory
         if user_id:
             conversation_manager.add_exchange(user_id, query, response_text)
-            
-            # Store in vector memory
             try:
                 memory = get_memory()
                 memory.add_interaction(user_id, query, response_text)
             except Exception as e:
-                logger.warning(f"[{request_id}] Error storing in memory: {str(e)}")
-        
-        logger.info(f"[{request_id}] Successfully processed query")
+                logger.warning(f"Memory storage error: {str(e)}")
+                
         return response_text
-        
-    except LLMException as e:
-        logger.error(f"[{request_id}] LLM error: {str(e)}")
-        return "I encountered a problem while processing your request. Let me try again or please rephrase your question."
-        
+    
     except Exception as e:
-        logger.error(f"[{request_id}] Unexpected error: {str(e)}", exc_info=True)
-        return "I'm sorry, but something went wrong on my end. Please try again in a moment."
-
-def _is_reminder_request(query: str) -> bool:
-    """Check if query is a reminder request"""
-    reminder_keywords = [
-        "remind me", "set a reminder", "remember", "don't forget", 
-        "schedule", "calendar", "appointment"
-    ]
-    query_lower = query.lower()
-    return any(keyword in query_lower for keyword in reminder_keywords)
+        logger.error(f"Error processing query: {str(e)}", exc_info=True)
+        return "I'm sorry, but I encountered an error. Please try again."
 
 def _handle_reminder(query: str, user_id: str) -> str:
     """Extract reminder details and create a reminder event"""
