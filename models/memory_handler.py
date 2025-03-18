@@ -2,9 +2,13 @@ import chromadb
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from sentence_transformers import SentenceTransformer
 import threading
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 class BotMemory:
     def __init__(self, persist_directory="./vector_db"):
@@ -90,6 +94,7 @@ class BotMemory:
             # Sleep to prevent high CPU usage
             time.sleep(0.1)
     
+    
     def get_relevant_context(self, user_id, current_query, max_results=5):
         """Retrieve relevant past interactions based on semantic similarity with time awareness"""
         try:
@@ -156,7 +161,25 @@ class BotMemory:
         if self.bg_thread.is_alive():
             self.bg_thread.join(timeout=5)
         print("Memory system shutdown")
-
+    def reset_user_memory(self, user_id: str) -> bool:
+        """Delete all memory entries for a specific user"""
+        user_id = str(user_id)
+        try:
+            # Get all IDs for this user
+            results = self.collection.query(
+                query_embeddings=None,
+                where={"user_id": user_id},
+                n_results=1000  # Set high to get all entries
+            )
+            
+            if results and results.get("ids") and results["ids"][0]:
+                # Delete all matching IDs
+                self.collection.delete(ids=results["ids"][0])
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error resetting user memory: {e}")
+            return False
 # Singleton instance
 memory = BotMemory()
 

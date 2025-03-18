@@ -14,6 +14,7 @@ from utils.processing import DateTimeExtractor
 from datetime import datetime, timedelta
 import threading
 import time
+import pytz
 
 # Set up logging
 logging.basicConfig(
@@ -126,6 +127,121 @@ def handle_message(update: Update, context: CallbackContext) -> None:
         user_logger.error(f"Error processing message: {e}")
         update.message.reply_text("Sorry, I encountered an error while processing your message.")
 
+
+def reset_user_command(update: Update, context: CallbackContext) -> None:
+    """Handler for /reset command - resets user data"""
+    admin = update.effective_user
+    
+    # Only authorized admins can reset user data
+    authorized_admins = [1720592375, 1473396937]  # Your admin user IDs
+    if admin.id not in authorized_admins:
+        update.message.reply_text("Sorry, you're not authorized to reset user data.")
+        return
+    
+    # Check if a user ID was provided
+    if not context.args or len(context.args) != 1:
+        update.message.reply_text("Please provide a user ID to reset. Example: `/reset 123456789`")
+        return
+    
+    try:
+        # Get the user ID to reset
+        target_user_id = str(context.args[0])
+        
+        # Reset conversation history
+        from models.llm_handler import conversation_manager
+        conv_reset = conversation_manager.reset_user_data(target_user_id)
+        
+        # Reset vector memory
+        memory = get_memory()
+        mem_reset = memory.reset_user_memory(target_user_id)
+        
+        # Reset calendar
+        cal_reset = calendar_system.reset_user_calendar(target_user_id)
+        
+        # Log the reset operation
+        user_logger.info(f"Admin {admin.id} reset data for user {target_user_id}")
+        
+        # Report success/failure
+        update.message.reply_text(
+            f"Reset for user {target_user_id}:\n"
+            f"- Conversation history: {'✅ Reset' if conv_reset else '❌ No data found'}\n"
+            f"- Long-term memory: {'✅ Reset' if mem_reset else '❌ No data found'}\n"
+            f"- Calendar events: {'✅ Reset' if cal_reset else '❌ No data found'}"
+        )
+        
+    except Exception as e:
+        update.message.reply_text(f"Error resetting user data: {str(e)}")
+        logger.error(f"Error in reset command: {str(e)}")
+def reset_my_data_command(update: Update, context: CallbackContext) -> None:
+    """Handler for /resetme command - allows users to reset their own data"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    # Ask for confirmation
+    update.message.reply_text(
+        "⚠️ This will delete all your conversation history, memories, and calendar events. "
+        "This action cannot be undone.\n\n"
+        "To confirm, reply with `/confirmreset`"
+    )
+    
+    # Store the pending reset in user data
+    context.user_data["pending_reset"] = True
+
+def check_reminders():
+    """Check for due reminders and send notifications"""
+    try:
+        due_reminders = calendar_system.get_due_reminders()
+        
+        for reminder in due_reminders:
+            user_id = reminder["user_id"]
+            event = reminder["event"]
+            
+            try:
+                bot.send_message(
+                    chat_id=int(user_id),
+                    text=f"🔔 REMINDER: {event['title']}",
+                    parse_mode="Markdown"
+                )
+                user_logger.info(f"Sent reminder to user {user_id}: {event['title']}")
+            except Exception as e:
+                logger.error(f"Error sending reminder to {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error checking reminders: {e}")
+
+def confirm_reset_command(update: Update, context: CallbackContext) -> None:
+    """Handler for /confirmreset command - confirms user data reset"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    # Check if reset was requested
+    if not context.user_data.get("pending_reset"):
+        update.message.reply_text("No reset was requested. Use `/resetme` first.")
+        return
+    
+    # Clear the pending flag
+    context.user_data["pending_reset"] = False
+    
+    try:
+        # Reset all user data
+        from models.llm_handler import conversation_manager
+        conversation_manager.reset_user_data(user_id)
+        
+        memory = get_memory()
+        memory.reset_user_memory(user_id)
+        
+        calendar_system.reset_user_calendar(user_id)
+        
+        # Log the self-reset
+        user_logger.info(f"User {user_id} reset their own data")
+        
+        update.message.reply_text(
+            "✅ Your data has been reset. I've forgotten our previous conversations, "
+            "any stored memories, and your calendar events."
+        )
+        
+    except Exception as e:
+        update.message.reply_text(f"Error resetting your data: {str(e)}")
+
 def main():
     # Get token from environment variable
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -145,13 +261,19 @@ def main():
     dp.add_handler(CommandHandler("stats", stats_command))
     dp.add_handler(CommandHandler("calendar", calendar_command))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
+    dp.add_handler(CommandHandler("reset", reset_user_command))
+    dp.add_handler(CommandHandler("resetme", reset_my_data_command))
+    dp.add_handler(CommandHandler("confirmreset", confirm_reset_command))
     # Start the reminder scheduler
     reminder_scheduler.start(updater.bot)
     
-    # Register shutdown function for the scheduler
-    atexit.register(reminder_scheduler.stop)
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(timezone=pytz.UTC)
+    scheduler.add_job(check_reminders, 'interval', seconds=30)
+    scheduler.start()
 
+    # Make sure to register a clean shutdown
+    atexit.register(lambda: scheduler.shutdown())
 
     updater.start_polling()
     print("Bot is running!")

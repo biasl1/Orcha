@@ -16,21 +16,22 @@ from utils.processing import DateTimeExtractor
 logger = logging.getLogger(__name__)
 
 # System prompt template to guide behavior
-SYSTEM_PROMPT = """You are LennyBot, a professional AI assistant with time awareness. Your responses should:
+SYSTEM_PROMPT = """You are Orcha, a professional AI assistant.
 
-1. Be helpful, accurate, and professional
-2. Acknowledge time context - note how recently or long ago previous interactions occurred
-3. Consider the current time of day and date in your responses
-4. Reference specific dates and times when discussing schedules or deadlines
-5. Note significant gaps between conversations (e.g., "It's been -- since we last talked")
-6. Maintain professionalism while being mindful of time-appropriate greetings (morning/evening)
-7. Intelligently reason about calendar information when it's provided
-8. Offer relevant suggestions based on the user's schedule
-9. Identify potential schedule conflicts when they arise
+Basic time information is provided with each conversation:
+- FIRST_CONVERSATION means this is your first time talking to this user
+- SAME_CONVERSATION means you are in an ongoing conversation
+- SAME_DAY means you talked earlier today with this user
+- NEW_CONVERSATION means you talked on a different day
 
-The current date and time is provided with each query. Calendar information is included when available. Use this information to make your responses temporally relevant and helpful for schedule management.
+Use appropriate greetings based on this information:
+- For FIRST_CONVERSATION: Welcome the user
+- For SAME_CONVERSATION: Continue naturally
+- For SAME_DAY: Acknowledge resuming the conversation
+- For NEW_CONVERSATION: Greet as returning after some time
+
+Always be professional, helpful, and to the point in your responses.
 """
-
 
 class LLMException(Exception):
     """Custom exception for LLM-related errors"""
@@ -65,42 +66,26 @@ class ConversationManager:
         self.max_turns = max_conversation_turns
     
     def add_exchange(self, user_id: str, query: str, response: str) -> None:
-        """Add a query-response exchange to user's conversation history"""
+        """Add a query-response pair to conversation history"""
         now = datetime.now()
         
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         
-        # Calculate time since last message if available
-        time_context = ""
-        if self.conversations[user_id]:
-            last_msg_time = datetime.fromisoformat(self.conversations[user_id][-1]["timestamp"])
-            delta = now - last_msg_time
-            
-            if delta.days > 0:
-                time_context = f" (after {delta.days} days)"
-            elif delta.seconds > 3600:
-                time_context = f" (after {delta.seconds // 3600} hours)"
-            elif delta.seconds > 60:
-                time_context = f" (after {delta.seconds // 60} minutes)"
-        
-        # Add user message with timestamp
+        # Simply add the messages with their timestamps
         self.conversations[user_id].append({
             "role": "user",
             "content": query,
-            "timestamp": now.isoformat(),
-            "time_context": time_context
+            "timestamp": now.isoformat()
         })
         
-        # Add assistant response with timestamp
         self.conversations[user_id].append({
             "role": "assistant",
             "content": response,
-            "timestamp": now.isoformat(),
-            "time_context": ""  # No delay for assistant response
+            "timestamp": now.isoformat()
         })
         
-        # Keep only recent turns
+        # Trim to max_turns
         if len(self.conversations[user_id]) > self.max_turns * 2:
             self.conversations[user_id] = self.conversations[user_id][-self.max_turns * 2:]
     
@@ -122,8 +107,35 @@ class ConversationManager:
                 "role": msg["role"],
                 "content": content
             })
-        
+    
         return formatted_messages
+    
+    def reset_user_data(self, user_id: str) -> bool:
+        """Reset conversation history for a specific user"""
+        user_id = str(user_id)
+        try:
+            if user_id in self.conversations:
+                del self.conversations[user_id]
+                logger.info(f"Reset conversation history for user {user_id}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error resetting conversation for user {user_id}: {e}")
+            return False
+    def get_conversation(self, user_id: str) -> List[Dict[str, str]]:
+        """Get formatted conversation history for the LLM"""
+        if user_id not in self.conversations:
+            return []
+        
+        # Convert internal conversation format to LLM format
+        formatted = []
+        for msg in self.conversations[user_id]:
+            formatted.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        return formatted
 
 # Initialize conversation manager
 conversation_manager = ConversationManager()
@@ -275,21 +287,159 @@ def _detect_calendar_intent(query: str) -> tuple:
     # No calendar intent detected
     return None, query
 
-# Update the process_query function to handle calendar requests
+def get_simple_time_context(user_id):
+    """Generate simple time context that's hard to misinterpret"""
+    now = datetime.now()
+    
+    # Format current time in a clear way
+    current_time = now.strftime("%I:%M %p")
+    today = now.strftime("%A, %B %d, %Y")
+    
+    # Get last interaction time if available
+    last_time = None
+    if user_id in conversation_manager.conversations and conversation_manager.conversations[user_id]:
+        for msg in reversed(conversation_manager.conversations[user_id]):
+            if msg["role"] == "user" and "timestamp" in msg:
+                try:
+                    last_time = datetime.fromisoformat(msg["timestamp"])
+                    break
+                except:
+                    pass
+    
+    # Build simple context statement
+    if not last_time:
+        return f"FIRST_CONVERSATION | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
+    
+    # Determine if this is the same day
+    if last_time.date() == now.date():
+        if (now - last_time).seconds < 3600:  # Less than an hour
+            return f"SAME_CONVERSATION | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
+        else:
+            last_time_str = last_time.strftime("%I:%M %p")
+            return f"SAME_DAY | LAST_MESSAGE_AT: {last_time_str} | CURRENT_TIME: {current_time}"
+    else:
+        # Different day - don't try to calculate days difference, just state the facts
+        last_date = last_time.strftime("%A, %B %d")
+        return f"NEW_CONVERSATION | LAST_CONVERSATION_ON: {last_date} | TODAY_IS: {today} | CURRENT_TIME: {current_time}"
+
+# Also, move _handle_calendar_creation function here from calendar.py
+def _handle_calendar_creation(query: str, user_id: str) -> str:
+    """Extract event details from natural language and create calendar event"""
+    try:
+        # First, extract datetime
+        event_time = DateTimeExtractor.extract_datetime(query)
+        
+        if not event_time:
+            # If no time found, ask LLM to help understand the request
+            system_prompt = """You are a calendar assistant. Extract the following from the text:
+1. Event title
+2. Date and time (if specified)
+3. Duration (if specified)
+4. Any other relevant details
+
+Format your response as JSON:
+{
+  "title": "extracted title",
+  "date": "extracted date or null",
+  "time": "extracted time or null",
+  "duration": "extracted duration or null",
+  "details": "other details"
+}"""
+
+            # Use a separate LLM call to analyze the scheduling request
+            extraction_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Extract scheduling information from: {query}"}
+            ]
+            
+            extraction_response = llm_client.query(extraction_messages, temperature=0.2)
+            response_text = extraction_response["message"]["content"]
+            
+            # Try to extract JSON from response
+            try:
+                # Find JSON block (might be formatted in markdown)
+                import re
+                json_match = re.search(r'```(?:json)?(.*?)```', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = response_text
+                
+                # Clean and parse JSON
+                json_str = json_str.strip()
+                extracted = json.loads(json_str)
+                
+                title = extracted.get("title", "Untitled Event")
+                
+                # Try to construct a datetime from parts
+                if extracted.get("date") or extracted.get("time"):
+                    # Use simple heuristics - this could be improved with a more sophisticated parser
+                    date_str = extracted.get("date", "today")
+                    time_str = extracted.get("time", "12:00")
+                    
+                    datetime_str = f"{date_str} at {time_str}"
+                    event_time = DateTimeExtractor.extract_datetime(datetime_str)
+                
+                description = extracted.get("details", "")
+                
+            except Exception as e:
+                logger.error(f"Error parsing extraction response: {e}")
+                return "I couldn't understand the event details. Could you please specify when this event should be scheduled?"
+                
+        # If we found a time, extract the title
+        if event_time:
+            # Extract title using simple heuristics
+            title = query
+            
+            # Remove time indicators
+            time_indicators = ["today", "tomorrow", "next", "on", "at", "schedule", "create event"]
+            for indicator in time_indicators:
+                title = title.replace(indicator, "")
+                
+            # Clean up title
+            title = title.strip()
+            if not title or len(title) < 3:
+                title = "Untitled Event"
+            
+            # Add the event
+            from utils.calendar import calendar_system
+            event = calendar_system.add_event(
+                user_id=user_id,
+                title=title,
+                timestamp=event_time,
+                description="",
+                reminder=True
+            )
+            
+            # Format response
+            day_str = event_time.strftime("%A, %B %d")
+            time_str = event_time.strftime("%I:%M %p")
+            return f"✅ I've added \"{title}\" to your calendar on {day_str} at {time_str}."
+        
+        return "I couldn't determine when to schedule this event. Could you please specify a date and time?"
+        
+    except Exception as e:
+        logger.error(f"Error creating calendar event: {e}")
+        return "I had trouble creating that calendar event. Could you try again with a clearer date and time?"
+    
+
 def process_query(query: str, user_id: Optional[str] = None) -> str:
-    """Process a user query with context and return a response"""
+    """Process a user query with simple time context"""
     request_id = str(uuid.uuid4())[:8]
     current_time = datetime.now()
     logger.info(f"[{request_id}] Processing query for user {user_id} at {current_time.isoformat()}: {query[:50]}...")
-
+    
     # Initialize is_calendar_query to False by default
     is_calendar_query = False
-
+    
     try:
+        # Get simple time context
+        time_context = get_simple_time_context(user_id) if user_id else "FIRST_CONVERSATION"
+        
         # Detect calendar-related intents
         calendar_intent, _ = _detect_calendar_intent(query)
         
-        # Handle calendar-specific intents
+        # Handle calendar-specific intents directly
         if calendar_intent == "remind":
             result = _handle_reminder(query, user_id)
             # Store in memory and conversation
@@ -311,86 +461,46 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
                 except Exception as e:
                     logger.warning(f"Error storing in memory: {str(e)}")
             return result
-        elif calendar_intent == "view":
-            # For viewing calendar, we'll use the calendar context in the LLM response
+        elif calendar_intent in ["view", "find_time", "delete"]:
             is_calendar_query = True
-        elif calendar_intent == "find_time":
-            # For find_time, add available slots to the context
-            today = datetime.now().date()
-            tomorrow = today + timedelta(days=1)
-            slots_today = calendar_system.suggest_times(user_id, preferred_date=today)
-            slots_tomorrow = calendar_system.suggest_times(user_id, preferred_date=tomorrow)
-            
-            available_text = "Available times:\n\nToday:\n"
-            for start, end in slots_today:
-                available_text += f"- {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
-            
-            available_text += "\nTomorrow:\n"
-            for start, end in slots_tomorrow:
-                available_text += f"- {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
-            
-            # Add this to the system prompt
-            system_prompt += f"\n\n{available_text}"
-            is_calendar_query = True
-
+        
         # Prepare messages
         messages = []
         
-        # Add system prompt with current time
-        current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
-        system_prompt = f"{SYSTEM_PROMPT}\n\nCurrent date and time: {current_time_str}"
+        # Create system prompt with time context
+        system_content = f"{SYSTEM_PROMPT}\n\nTIME_CONTEXT: {time_context}"
         
-        # Always include calendar context for calendar-related queries
+        # Add calendar context for calendar queries or if events today
         if user_id and is_calendar_query:
             calendar_context = _get_calendar_context(user_id)
-            if (calendar_context):
-                system_prompt += calendar_context
-                
-                # For calendar-specific operations, add special instructions
-                if calendar_intent == "create":
-                    system_prompt += "\nThe user wants to create a calendar event. Help extract the event title, date, time, and any other details."
-                elif calendar_intent == "view":
-                    system_prompt += "\nThe user wants to view their calendar. Summarize their schedule in a helpful way."
-                elif calendar_intent == "delete":
-                    system_prompt += "\nThe user wants to cancel or delete an event. Help identify which event they're referring to."
-                elif calendar_intent == "find_time":
-                    system_prompt += "\nThe user wants to find available time. Analyze their schedule and suggest some free slots."
-        
-        # Regular (non-calendar) queries can still benefit from calendar context sometimes
+            if calendar_context:
+                system_content += calendar_context
         elif user_id:
+            # For regular queries, check if there are events today
+            from utils.calendar import calendar_system
             events_today = calendar_system.get_upcoming_events(user_id, days=1)
             if events_today:
-                # Only add brief calendar context for regular queries
                 calendar_brief = f"You have {len(events_today)} event(s) scheduled today."
-                system_prompt += f"\n\n{calendar_brief}"
+                system_content += f"\n\n{calendar_brief}"
         
-        messages.append({"role": "system", "content": system_prompt})
+        # Add system message
+        messages.append({"role": "system", "content": system_content})
         
-        # Add conversation context if user_id available
+        # Add conversation history
         if user_id:
-            recent_conversation = conversation_manager.get_recent_conversation(user_id)
-            if recent_conversation:
-                messages.extend(recent_conversation)
+            history = conversation_manager.get_conversation(user_id)
+            messages.extend(history)
         
-        # Get memory instance and retrieve relevant context
-        memory = get_memory()
-        context = None
+        # Add memory context if available
         if user_id:
-            try:
-                context = memory.get_relevant_context(user_id, query)
-                # Only include context if it's different from the original query
-                if context and context != query:
-                    messages.append({
-                        "role": "system", 
-                        "content": f"Relevant from previous conversations: {context}"
-                    })
-            except Exception as e:
-                logger.warning(f"[{request_id}] Error retrieving memory context: {str(e)}")
+            memory = get_memory()
+            context_query = memory.get_relevant_context(user_id, query)
+            if context_query != query:
+                query = context_query
         
-        query_with_time = f"{query}\n\nCurrent time: {current_time_str}"
-        # Add current query if not already in conversation
-        if not messages or messages[-1]["role"] != "user" or messages[-1]["content"] != query:
-            messages.append({"role": "user", "content": query_with_time})
+        # Add user query (with timestamp embedded directly)
+        time_stamp = current_time.strftime("%I:%M %p")
+        messages.append({"role": "user", "content": f"{query} [SENT_AT: {time_stamp}]"})
         
         # Check LLM availability
         if not llm_client.check_availability():
@@ -398,10 +508,9 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
             return "I'm sorry, but I'm currently unable to process your request due to a service issue. Please try again in a few moments."
         
         # Query LLM
-        logger.debug(f"[{request_id}] Sending messages to LLM: {len(messages)} messages")
         response_data = llm_client.query(messages)
         
-        # Extract and validate response
+        # Extract and clean response
         response_text = response_data["message"]["content"]
         response_text = ResponseValidator.clean(response_text)
         
@@ -411,6 +520,7 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
             
             # Store in vector memory
             try:
+                memory = get_memory()
                 memory.add_interaction(user_id, query, response_text)
             except Exception as e:
                 logger.warning(f"[{request_id}] Error storing in memory: {str(e)}")
@@ -436,51 +546,82 @@ def _is_reminder_request(query: str) -> bool:
     return any(keyword in query_lower for keyword in reminder_keywords)
 
 def _handle_reminder(query: str, user_id: str) -> str:
-    """Extract reminder information and save to calendar"""
+    """Extract reminder details and create a reminder event"""
+    from utils.processing import DateTimeExtractor
+    from utils.calendar import calendar_system
+    from datetime import datetime, timedelta
+    import re
+    
     try:
-        # Extract date/time
+        # First try to extract time from query
         reminder_time = DateTimeExtractor.extract_datetime(query)
         
+        # If no specific time found, look for relative time indicators
         if not reminder_time:
-            return "I'd be happy to set a reminder, but I couldn't determine when. Please specify a date or time, like 'tomorrow at 3pm' or 'next Monday'."
-        
-        # Extract title - simple approach: use text before "remind me" or after "to"
-        title = ""
-        if "remind me to" in query.lower():
-            title = query.lower().split("remind me to", 1)[1].strip()
-        elif "reminder to" in query.lower():
-            title = query.lower().split("reminder to", 1)[1].strip()
-        elif "remember to" in query.lower():
-            title = query.lower().split("remember to", 1)[1].strip()
-        else:
-            # Fallback: use the whole query as title
-            title = query
+            # Look for patterns like "in 10 minutes" or "after 2 hours"
+            time_pattern = r'in (\d+) (minute|minutes|mins|min|hour|hours|hr|hrs)'
+            match = re.search(time_pattern, query.lower())
             
-        # Clean up title
-        time_markers = ["today", "tomorrow", "next week", "in", "at", "on"]
-        for marker in time_markers:
-            if f" {marker} " in title:
-                title = title.split(f" {marker} ")[0].strip()
+            if match:
+                amount = int(match.group(1))
+                unit = match.group(2)
                 
-        if not title:
-            title = "Reminder"
+                now = datetime.now()
+                
+                if unit.startswith('minute') or unit.startswith('min'):
+                    reminder_time = now + timedelta(minutes=amount)
+                elif unit.startswith('hour') or unit.startswith('hr'):
+                    reminder_time = now + timedelta(hours=amount)
         
-        # Add to calendar
-        event = calendar_system.add_event(
-            user_id=user_id,
-            title=title,
-            timestamp=reminder_time,
-            description="",
-            reminder=True
-        )
+        # If we found a time, create the reminder
+        if reminder_time:
+            # Extract what the reminder is for
+            action_text = query
+            
+            # Try to extract the action (what to be reminded of)
+            action_patterns = [
+                r'remind me to (.+?) in \d+',
+                r'remind me in \d+.+? to (.+)',
+                r'remind me (.+?) after \d+',
+                r'remember me in \d+.+? to (.+)',
+                r'reminder to (.+?) in \d+',
+                r'reminder for (.+?) in \d+',
+            ]
+            
+            for pattern in action_patterns:
+                match = re.search(pattern, query.lower())
+                if match:
+                    action_text = match.group(1).strip()
+                    break
+            
+            # Clean up the title if needed
+            if len(action_text) > 100 or action_text.lower() == query.lower():
+                # Just extract relevant part or use generic title
+                action_text = "Reminder"
+            
+            # Create calendar event
+            event = calendar_system.add_event(
+                user_id=user_id,
+                title=action_text,
+                timestamp=reminder_time,
+                description="Created from chat reminder",
+                reminder=True
+            )
+            
+            # Format time for response
+            if (reminder_time - datetime.now()).total_seconds() < 3600:  # Less than an hour
+                minutes = round((reminder_time - datetime.now()).total_seconds() / 60)
+                time_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+            else:
+                time_str = reminder_time.strftime("%I:%M %p")
+            
+            return f"✅ I'll remind you to {action_text} in {time_str}."
         
-        # Format response
-        when = reminder_time.strftime("%A, %B %d at %I:%M %p")
-        return f"✅ I've set a reminder for you: \"{title}\" on {when}. I'll remind you when it's time!"
+        return "I couldn't determine when to set your reminder. Could you please specify a time? For example, 'Remind me in 10 minutes' or 'Remind me at 3pm'."
         
     except Exception as e:
         logger.error(f"Error setting reminder: {e}")
-        return "I'm sorry, I couldn't set that reminder. Please try again with a clearer time specification."
+        return "I had trouble setting that reminder. Could you try again with a clearer time?"
 
 def get_metrics() -> Dict[str, Any]:
     """Return current performance metrics"""
