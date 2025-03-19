@@ -299,6 +299,24 @@ class CalendarSystem:
         
         # Return a copy to avoid modifying original data
         return self.user_calendars[user_id].copy()
+    def check_conflicts(self, user_id, proposed_time, duration_minutes=60):
+        """Check for conflicts with existing events"""
+        user_id = str(user_id)
+        if user_id not in self.user_calendars:
+            return []
+            
+        conflicts = []
+        proposed_end = proposed_time + timedelta(minutes=duration_minutes)
+        
+        for event in self.user_calendars[user_id]:
+            event_time = event['timestamp']
+            event_end = event_time + timedelta(minutes=60)  # Assume 1 hour default
+            
+            # Check for overlap
+            if (proposed_time <= event_end and proposed_end >= event_time):
+                conflicts.append(event)
+        
+        return conflicts
     
 # Global calendar instance
 calendar_system = CalendarSystem()

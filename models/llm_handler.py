@@ -15,14 +15,23 @@ from utils.processing import DateTimeExtractor
 # Set up logging
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are Lenny, a professional AI assistant.
+SYSTEM_PROMPT = """You are Lenny, a professional AI assistant with calendar awareness.
 
-Time information provided with each query:
-- FIRST_CONVERSATION: Welcome the user
-- SAME_DAY: Be conversational but acknowledge you've spoken earlier today
-- RETURNING_USER: Greet user as returning
+TIME AWARENESS:
+- FIRST_CONVERSATION: Welcome the user as new
+- SAME_DAY: Continue our ongoing conversation naturally
+- RETURNING_USER: Acknowledge the user's return after time away
 
-Be professional, helpful, and focused in your responses.
+CALENDAR INSTRUCTIONS:
+1. ALWAYS reference imminent events (within next 2 hours) in your responses
+2. Mention today's events when relevant to the conversation
+3. If discussing future plans, note any scheduled events that might conflict
+4. Use knowledge of the user's schedule to provide more helpful responses
+5. When asked about availability, check the calendar information provided
+6. If a user seems to be planning something when they have an event scheduled, 
+   proactively mention the potential conflict
+
+Be helpful, professional, and context-aware in all responses.
 """
 
 class LLMException(Exception):
@@ -194,38 +203,146 @@ class LLMClient:
 # Initialize LLM client
 llm_client = LLMClient()
 
-# Replace _get_calendar_context with this enhanced version
-def _get_calendar_context(user_id: str) -> str:
-    """Get comprehensive calendar context for the LLM"""
+# Replace the _get_calendar_context function with this enhanced version
+def _get_calendar_context(user_id: str, include_prompts=True) -> str:
+    """Get smart calendar context with timing relevance"""
     try:
-        # Get rich calendar context using the new method
-        context = calendar_system.get_calendar_context(user_id)
-        if context:
-            return f"\n\n---\nCALENDAR INFORMATION:\n{context}\n---\n"
-        return ""
+        from utils.calendar import calendar_system
+        now = datetime.now()
+        
+        # Get upcoming events for different time horizons
+        events_today = calendar_system.get_upcoming_events(user_id, days=1)
+        events_tomorrow = calendar_system.get_upcoming_events(user_id, days=2)
+        events_week = calendar_system.get_upcoming_events(user_id, days=7)
+        
+        # Format events by urgency
+        imminent_events = []  # Next 2 hours
+        today_events = []     # Rest of today
+        tomorrow_events = []  # Tomorrow
+        week_events = []      # This week
+        
+        # Sort events by urgency
+        for event in events_today:
+            event_time = event['timestamp']
+            time_until = event_time - now
+            hours_until = time_until.total_seconds() / 3600
+            
+            if hours_until < 2 and hours_until > 0:
+                imminent_events.append(event)
+            elif event_time.date() == now.date():
+                today_events.append(event)
+        
+        # Tomorrow's events
+        for event in events_tomorrow:
+            if event['timestamp'].date() == (now + timedelta(days=1)).date():
+                tomorrow_events.append(event)
+        
+        # Rest of week's events (excluding today and tomorrow)
+        for event in events_week:
+            if (event['timestamp'].date() > (now + timedelta(days=1)).date() and 
+                event['timestamp'].date() <= (now + timedelta(days=7)).date()):
+                week_events.append(event)
+        
+        # Build context string based on what's most relevant
+        context_parts = ["CALENDAR INFORMATION:"]
+        
+        # Imminent events (most urgent)
+        if imminent_events:
+            context_parts.append("\nIMMINENT EVENTS (next 2 hours):")
+            for event in imminent_events:
+                time_str = event['timestamp'].strftime("%I:%M %p")
+                time_until = event['timestamp'] - now
+                minutes_until = int(time_until.total_seconds() / 60)
+                context_parts.append(f"- {event['title']} at {time_str} (in {minutes_until} minutes)")
+        
+        # Today's events
+        if today_events:
+            context_parts.append("\nTODAY'S EVENTS:")
+            for event in today_events:
+                time_str = event['timestamp'].strftime("%I:%M %p")
+                context_parts.append(f"- {event['title']} at {time_str}")
+        elif not imminent_events:
+            context_parts.append("\nNo more events scheduled for today.")
+        
+        # Tomorrow's events
+        if tomorrow_events:
+            context_parts.append("\nTOMORROW'S EVENTS:")
+            for event in tomorrow_events:
+                time_str = event['timestamp'].strftime("%I:%M %p")
+                context_parts.append(f"- {event['title']} at {time_str}")
+        
+        # Week events (if no urgent events)
+        if not (imminent_events or today_events) and week_events:
+            context_parts.append("\nUPCOMING THIS WEEK:")
+            for event in week_events[:3]:  # Limit to 3 events
+                day_str = event['timestamp'].strftime("%A")
+                time_str = event['timestamp'].strftime("%I:%M %p")
+                context_parts.append(f"- {event['title']} on {day_str} at {time_str}")
+        
+        # Add prompts for the LLM if needed
+        if include_prompts and (imminent_events or today_events or tomorrow_events):
+            context_parts.append("\nCALENDAR INSTRUCTIONS:")
+            if imminent_events:
+                context_parts.append("- Proactively mention imminent events when relevant")
+            if today_events:
+                context_parts.append("- Reference today's schedule when appropriate")
+            if tomorrow_events:
+                context_parts.append("- Note tomorrow's events if the user is planning ahead")
+        
+        return "\n".join(context_parts)
     except Exception as e:
         logger.error(f"Error getting calendar context: {str(e)}")
         return ""
 
-# Add this helper function for natural language calendar operations
+# Calendar intent detection for LLM
 def _detect_calendar_intent(query: str) -> tuple:
-    """Detect basic calendar intents in user query"""
+    """Detect calendar intents with expanded natural language understanding"""
     query_lower = query.lower()
     
-    # Map keywords to intents
+    # Expanded intent patterns with more natural language options
     intent_patterns = {
-        "create": ["schedule", "add event", "create event", "new appointment"],
-        "view": ["what's on my calendar", "my schedule", "what do i have", "appointments"],
-        "delete": ["cancel", "delete event", "remove appointment"],
-        "remind": ["remind me", "reminder", "remember to"],
-        "find_time": ["free time", "available", "when am i free"]
+        "create": [
+            "schedule", "add event", "create event", "new appointment",
+            "put on my calendar", "book", "plan", "arrange", "set up",
+            "organize", "add to calendar", "mark on calendar",
+            "pencil in", "reserve", "block out time", "slot in"
+        ],
+        "view": [
+            "what's on my calendar", "my schedule", "what do i have",
+            "appointments", "what's happening", "what's planned",
+            "check calendar", "show events", "upcoming events",
+            "what's next", "agenda", "what am i doing", "plans",
+            "schedule for", "do i have anything", "any events"
+        ],
+        "delete": [
+            "cancel", "delete event", "remove appointment",
+            "take off calendar", "clear", "erase", "unschedule",
+            "remove from calendar", "no longer", "don't need appointment",
+            "get rid of event", "scratch that event"
+        ],
+        "remind": [
+            "remind me", "reminder", "remember to", "alert me",
+            "don't let me forget", "notification", "ping me when",
+            "let me know when", "make sure i", "send a reminder"
+        ],
+        "find_time": [
+            "free time", "available", "when am i free",
+            "open slot", "gap in schedule", "time slot",
+            "opening", "availability", "when can i", "possible times",
+            "schedule gap", "free slot", "not busy", "have time for"
+        ]
     }
     
-    # Check for intent matches
+    # Try to match the most specific patterns first
     for intent, patterns in intent_patterns.items():
-        if any(pattern in query_lower for pattern in patterns):
-            return intent, query
+        # Sort patterns by length (longest/most specific first)
+        sorted_patterns = sorted(patterns, key=len, reverse=True)
+        
+        for pattern in sorted_patterns:
+            if pattern in query_lower:
+                return intent, query
     
+    # No intent detected
     return None, query
 
 def get_simple_time_context(user_id):
@@ -390,14 +507,35 @@ def process_query(query: str, user_id: Optional[str] = None) -> str:
         is_calendar_query = calendar_intent in ["view", "find_time", "delete"]
         if user_id:
             if is_calendar_query:
-                calendar_context = _get_calendar_context(user_id)
+                # Full calendar context for calendar-specific queries
+                calendar_context = _get_calendar_context(user_id, include_prompts=True)
                 if calendar_context:
-                    messages[0]["content"] += calendar_context
+                    messages[0]["content"] += f"\n\n{calendar_context}"
             else:
-                # Just add brief calendar info for non-calendar queries
-                events_today = calendar_system.get_upcoming_events(user_id, days=1)
-                if events_today:
-                    messages[0]["content"] += f"\n\nYou have {len(events_today)} event(s) today."
+                # Add relevant calendar info for ALL queries, not just calendar ones
+                now = datetime.now()
+                # Get events for today and check if any are coming up soon
+                events = calendar_system.get_upcoming_events(user_id, days=1)
+                imminent_events = []
+                
+                for event in events:
+                    event_time = event['timestamp']
+                    time_until = event_time - now
+                    hours_until = time_until.total_seconds() / 3600
+                    if hours_until > 0 and hours_until < 2:  # Next 2 hours
+                        imminent_events.append(event)
+                
+                # Always add calendar context, just with different detail levels
+                if imminent_events:
+                    # Imminent events get highlighted prominently
+                    calendar_context = _get_calendar_context(user_id, include_prompts=True)
+                    if calendar_context:
+                        messages[0]["content"] += f"\n\n{calendar_context}"
+                elif events:
+                    # Some events today, but not imminent - add brief reminder
+                    cal_brief = f"The user has {len(events)} event(s) scheduled today."
+                    messages[0]["content"] += f"\n\nCALENDAR BRIEF: {cal_brief}"
+                    messages[0]["content"] += "\nMention the user's schedule if relevant to the conversation."
         
         # Add conversation history and memory
         if user_id:
